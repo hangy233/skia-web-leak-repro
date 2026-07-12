@@ -81,7 +81,7 @@ perfectly linear at ~430 KB/s (~7 KB per frame). At that rate the initial
 
 ## Minimal repro
 
-Repo: <!-- link after publishing --> (Expo 56 web, skia 2.6.2, reanimated
+Repo: https://github.com/hangy233/skia-web-leak-repro.git (Expo 56 web, skia 2.6.2, reanimated
 4.3.1, canvaskit-wasm 0.41.0). The demo renders 16 circles animated by one
 shared value and shows a live on-screen readout of `CanvasKit.HEAPU8.length`
 plus a malloc high-water probe.
