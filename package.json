@@ -1,0 +1,23 @@
+{
+  "name": "skia-web-leak-repro",
+  "version": "1.0.0",
+  "main": "index.ts",
+  "private": true,
+  "scripts": {
+    "web": "expo start --web"
+  },
+  "dependencies": {
+    "@shopify/react-native-skia": "2.6.2",
+    "canvaskit-wasm": "0.41.0",
+    "expo": "~56.0.12",
+    "react": "19.2.3",
+    "react-dom": "19.2.3",
+    "react-native": "0.85.3",
+    "react-native-reanimated": "4.3.1",
+    "react-native-web": "^0.21.2"
+  },
+  "devDependencies": {
+    "@types/react": "~19.2.2",
+    "typescript": "~6.0.3"
+  }
+}
