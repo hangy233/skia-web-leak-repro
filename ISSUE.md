@@ -1,20 +1,25 @@
 <!-- Draft issue for github.com/Shopify/react-native-skia -->
 
-# Web: sksg replay path leaks CanvasKit WASM objects every frame → `Aborted()` after minutes of animation
+# Web: sksg replay path leaks CanvasKit WASM objects every frame → `Aborted()` crash
 
 ## Description
 
 On web, any continuously animated `<Canvas>` leaks CanvasKit WASM memory on
 every frame until the WASM heap hits its ceiling and CanvasKit throws
-`Aborted()` (typically while constructing the next `PictureRecorder`). After
-the abort, the runtime is dead and every subsequent frame fails — in our app
-as an infinite `Cannot pass deleted object as Image const*` loop.
+`RuntimeError: Aborted()` (typically while allocating during the next frame,
+e.g. constructing a `PictureRecorder`). After the abort, the runtime is dead
+and every subsequent frame fails — in our app as an infinite
+`Cannot pass deleted object as Image const*` loop.
 
 The root cause is that the web replay path (`sksg/Recorder`) creates WASM
-objects per frame and never disposes them. On web there is no
-`FinalizationRegistry` hookup for CanvasKit objects, so JS garbage collection
-never frees WASM memory — only explicit `dispose()`/`delete()` does, and the
-replay path never calls it.
+objects per frame and never disposes them. Although canvaskit-wasm's embind
+bindings register wrappers in a `FinalizationRegistry`, that only frees
+native objects when the **JS** garbage collector happens to run — and the JS
+GC cannot see WASM memory pressure. A typical animated scene produces almost
+no JS garbage per frame, so the GC idles while the WASM heap fills at MB/s,
+unreclaimed (measured: linear growth for minutes with zero reclamation).
+Only explicit `dispose()`/`delete()` frees the memory deterministically, and
+the replay path never calls it.
 
 Verified on `2.6.2`; the same code is present on `main` as of 2026-07-12
 (`packages/skia/src/sksg/Recorder/Player.ts`, `DrawingContext.ts`).
@@ -51,7 +56,11 @@ Native is unaffected (separate C++ recorder pipeline).
    `materializePaint` — is dropped without disposal after being set on a
    paint.
 
-4. **`sksg/Container.web.tsx`** — each React commit calls `redraw()`, which
+4. **`sksg/Recorder/commands/Drawing.ts`** — `drawVertices` rebuilds the full
+   WASM `SkVertices` buffer (the entire position/color data) every frame and
+   never disposes it.
+
+5. **`sksg/Container.web.tsx`** — each React commit calls `redraw()`, which
    records with a fresh `paintPool`, orphaning every paint in the superseded
    pool. The view side (`SkiaViewApi.setJsiProperty(id, "picture", ...)` /
    `SkiaPictureView.web.tsx setPicture`) also overwrites the previous frame's
@@ -67,42 +76,52 @@ fps)**. 3-minute soak, identical inputs:
 |---|---|---|
 | Reserved WASM heap (`HEAPU8.length`) | 128 MB → **221 MB, climbing** | **128 MB, flat** |
 | Malloc high-water probe | 5.6 → 199 MB, linear, no plateau | 4.8 → 14.5 MB, plateaus after ~150 s |
-| Outcome extrapolated | `Aborted()` at ~30 min of play | stable |
+| Outcome | `Aborted()` after ~30 min of play | stable |
 
-Minimal repro (16 animated circles with `RadialGradient` + `BlurMask`, idle —
-no user interaction): malloc high-water climbs **2.6 MB → 54.0 MB in 120 s**,
-perfectly linear at ~430 KB/s (~7 KB per frame). At that rate the initial
-128 MB reservation is exhausted in ~5 minutes and the heap ceiling in under
-90 minutes.
+Minimal repro (196 small animated circles with `RadialGradient` + `BlurMask`,
+idle — no user interaction): leaks **~5 MB/s** and crashes with
+`RuntimeError: Aborted()` in **~25 seconds** (see repro notes below).
 
-| t (s) | 0 | 30 | 60 | 90 | 120 |
-|---|---|---|---|---|---|
-| high-water (MB) | 2.6 | 15.5 | 28.5 | 41.2 | 54.0 |
+| t (s) | 0 | 5 | 10 | 15 | 20 | 25 |
+|---|---|---|---|---|---|---|
+| high-water (MB) | 5.8 | 30.3 | 54.9 | 79.1 | 102.4 | **Aborted()** |
 
 ## Minimal repro
 
-Repo: https://github.com/hangy233/skia-web-leak-repro.git (Expo 56 web, skia 2.6.2, reanimated
-4.3.1, canvaskit-wasm 0.41.0). The demo renders 16 circles animated by one
-shared value and shows a live on-screen readout of `CanvasKit.HEAPU8.length`
-plus a malloc high-water probe.
+Repo: https://github.com/hangy233/skia-web-leak-repro (Expo 56 web,
+skia 2.6.2, reanimated 4.3.1, canvaskit-wasm 0.41.0). The demo renders 196
+circles animated by one shared value and shows a live on-screen readout of
+`CanvasKit.HEAPU8.length` plus a malloc high-water probe, and a crash banner
+reporting time-to-abort.
 
 ```tsx
 const Dot = ({ index, clock }) => {
-  const r = useDerivedValue(() => 10 + 8 * Math.sin(2 * Math.PI * (clock.value + index / 16)));
+  const r = useDerivedValue(() => 5 + 4 * Math.sin(2 * Math.PI * (clock.value + index / 196)));
   return (
     <Circle cx={cx} cy={cy} r={r}>
-      <RadialGradient c={vec(cx, cy)} r={20} colors={['#00FFCC', '#00334400']} />
-      <BlurMask blur={6} style="normal" />
+      <RadialGradient c={vec(cx, cy)} r={12} colors={['#00FFCC', '#00334400']} />
+      <BlurMask blur={3} style="normal" />
     </Circle>
   );
 };
 ```
 
 Steps:
-1. `npm install && npx expo start --web`
+1. `npm install && npm run web`
 2. Open the page, wait for CanvasKit to load, leave it running.
-3. Watch the on-screen counter: the malloc high-water climbs continuously and
-   the reserved heap steps up each time the current reservation is exhausted.
+3. The malloc high-water climbs ~5 MB/s; after ~25 s the page crashes with
+   `RuntimeError: Aborted()` and shows a red crash banner.
+
+Note on time compression: so the issue is demonstrable in seconds instead of
+30+ minutes, the demo caps the WASM heap at its initial 128 MB by making
+`WebAssembly.Memory.grow()` throw (`App.tsx`, clearly marked). Emscripten
+treats that exactly like the browser refusing to enlarge memory at the real
+2–4 GB ceiling, so the failure path is identical to production. Set
+`CAP_WASM_HEAP_AT_INITIAL = false` to watch the heap grow unbounded instead.
+
+The repo's **`fix` branch** is the same demo with a patch-package patch that
+adds the missing disposals — same scene, same cap, runs indefinitely with the
+high-water plateauing.
 
 ## How to observe the leak (since JS heap snapshots won't show it)
 
@@ -125,8 +144,9 @@ setInterval(() => console.log((probe() / 1048576).toFixed(1) + ' MB'), 5000);
 
 ## Fix that worked for us
 
-We're running a patch in production (happy to turn it into a PR against
-`packages/skia/src` if you're open to it):
+We're running this in production (happy to turn it into a PR against
+`packages/skia/src` if you're open to it). Full patch on the repro repo's
+`fix` branch: https://github.com/hangy233/skia-web-leak-repro/tree/fix
 
 - `DrawingContext`: track every transient created during a frame replay
   (shaders, filters, compose intermediates — the declaration arrays intercept
@@ -138,6 +158,7 @@ We're running a patch in production (happy to turn it into a PR against
 - `setBlurMaskFilter`: dispose the mask filter after `setMaskFilter` (the
   paint holds its own native ref). User-provided `filter` prop objects bypass
   tracking so they are never disposed out from under the caller.
+- `drawVertices`: dispose the per-frame `SkVertices` after the draw.
 - `Container.web` `drawOnscreen`: call `ctx.disposeTransients()` right after
   `finishRecordingAsPicture()` — safe because the picture holds native refs
   to everything it recorded. `redraw()` disposes the superseded recording's
@@ -145,9 +166,6 @@ We're running a patch in production (happy to turn it into a PR against
   invocation that can still fire after `stopMapper`** bails out instead of
   touching freed pool paints (without the flag this throws
   `BindingError: Paint instance already deleted`).
-
-Full patch (against the 2.6.2 `lib/module` output) with before/after
-measurements: https://github.com/hangy233/amoeba/pull/10
 
 Possibly related (same terminal symptom, different path): #2079, #2319.
 
