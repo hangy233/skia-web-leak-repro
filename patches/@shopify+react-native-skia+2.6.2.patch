@@ -1,0 +1,258 @@
+diff --git a/node_modules/@shopify/react-native-skia/lib/module/skia/web/JsiSkPaint.js b/node_modules/@shopify/react-native-skia/lib/module/skia/web/JsiSkPaint.js
+index 4671009..87ba813 100644
+--- a/node_modules/@shopify/react-native-skia/lib/module/skia/web/JsiSkPaint.js
++++ b/node_modules/@shopify/react-native-skia/lib/module/skia/web/JsiSkPaint.js
+@@ -56,10 +56,18 @@ export class JsiSkPaint extends HostObject {
+     return new JsiSkPaint(this.CanvasKit, this.ref.copy());
+   }
+   assign(paint) {
++    const prev = this.ref;
+     this.ref = paint.ref.copy();
++    if (prev && prev !== this.ref) {
++      prev.delete();
++    }
+   }
+   reset() {
++    const prev = this.ref;
+     this.ref = new this.CanvasKit.Paint();
++    if (prev) {
++      prev.delete();
++    }
+   }
+   getAlphaf() {
+     return this.getColor()[3];
+diff --git a/node_modules/@shopify/react-native-skia/lib/module/sksg/Container.web.js b/node_modules/@shopify/react-native-skia/lib/module/sksg/Container.web.js
+index 728bc58..08a008b 100644
+--- a/node_modules/@shopify/react-native-skia/lib/module/sksg/Container.web.js
++++ b/node_modules/@shopify/react-native-skia/lib/module/sksg/Container.web.js
+@@ -18,6 +18,11 @@ const {
+ const drawOnscreen = (Skia, nativeId, recording) => {
+   "worklet";
+ 
++  // A mapper invocation can still fire once after stopMapper; the superseded
++  // recording's paint pool is already disposed by then, so skip the frame.
++  if (recording.disposed) {
++    return;
++  }
+   const rec = Skia.PictureRecorder();
+   const canvas = rec.beginRecording();
+   //const start = performance.now();
+@@ -26,6 +31,10 @@ const drawOnscreen = (Skia, nativeId, recording) => {
+   replay(ctx, recording.commands);
+   const picture = rec.finishRecordingAsPicture();
+   rec.dispose();
++  // The picture holds native refs to everything it needs; release the
++  // frame's transient WASM objects (shaders, filters, paint copies) so
++  // continuous animations do not grow the CanvasKit heap until it aborts.
++  ctx.disposeTransients();
+   //const end = performance.now();
+   //console.log("Recording time: ", end - start);
+   SkiaViewApi.setJsiProperty(nativeId, "picture", picture);
+@@ -49,6 +58,12 @@ class ReanimatedContainer extends Container {
+     const {
+       animationValues
+     } = record;
++    // Each recording gets a fresh paint pool; dispose the superseded one or
++    // its WASM paints leak on every React commit.
++    if (this.recording) {
++      this.recording.disposed = true;
++      this.recording.paintPool.forEach(paint => paint.dispose());
++    }
+     this.recording = {
+       commands: record.commands,
+       paintPool: record.paintPool
+diff --git a/node_modules/@shopify/react-native-skia/lib/module/sksg/Recorder/DrawingContext.js b/node_modules/@shopify/react-native-skia/lib/module/sksg/Recorder/DrawingContext.js
+index d131685..0f45548 100644
+--- a/node_modules/@shopify/react-native-skia/lib/module/sksg/Recorder/DrawingContext.js
++++ b/node_modules/@shopify/react-native-skia/lib/module/sksg/Recorder/DrawingContext.js
+@@ -3,16 +3,42 @@ export const createDrawingContext = (Skia, paintPool, canvas) => {
+ 
+   // State (formerly class fields)
+   const paints = [];
+-  const colorFilters = [];
+-  const shaders = [];
+-  const imageFilters = [];
+-  const pathEffects = [];
++  // Transient CanvasKit objects created while replaying one frame. On web
++  // nothing garbage-collects WASM-backed objects, so every declaration
++  // (shader, filter, paint copy) must be disposed once the frame's picture
++  // has been recorded — the picture holds its own native refs.
++  const disposables = new Set();
++  const track = obj => {
++    if (obj) {
++      disposables.add(obj);
++    }
++    return obj;
++  };
++  const trackPushes = arr => {
++    arr.push = function () {
++      for (let i = 0; i < arguments.length; i++) {
++        track(arguments[i]);
++      }
++      return Array.prototype.push.apply(this, arguments);
++    };
++    return arr;
++  };
++  const colorFilters = trackPushes([]);
++  const shaders = trackPushes([]);
++  const imageFilters = trackPushes([]);
++  const pathEffects = trackPushes([]);
+   const paintDeclarations = [];
+   const opacities = [];
+   let nextPaintIndex = 1;
+ 
+-  // Initialize first paint and opacity
+-  paintPool[0] = Skia.Paint();
++  // Initialize first paint and opacity. Reuse the pool's base paint across
++  // frames (reset() swaps in a fresh default ref and deletes the old one)
++  // instead of overwriting it with a new allocation every frame.
++  if (paintPool[0]) {
++    paintPool[0].reset();
++  } else {
++    paintPool[0] = Skia.Paint();
++  }
+   paints.push(paintPool[0]);
+   opacities.push(1);
+ 
+@@ -42,7 +68,7 @@ export const createDrawingContext = (Skia, paintPool, canvas) => {
+     } else {
+       const cf = colorFilters.pop();
+       if (cf) {
+-        imageFilter = Skia.ImageFilter.MakeColorFilter(cf, null);
++        imageFilter = track(Skia.ImageFilter.MakeColorFilter(cf, null));
+       }
+     }
+     canvas.saveLayer(undefined, null, imageFilter);
+@@ -60,7 +86,7 @@ export const createDrawingContext = (Skia, paintPool, canvas) => {
+   const materializePaint = () => {
+     // Color Filters
+     if (colorFilters.length > 0) {
+-      getCurrentPaint().setColorFilter(colorFilters.reduceRight((inner, outer) => inner ? Skia.ColorFilter.MakeCompose(outer, inner) : outer));
++      getCurrentPaint().setColorFilter(colorFilters.reduceRight((inner, outer) => inner ? track(Skia.ColorFilter.MakeCompose(outer, inner)) : outer));
+     }
+     // Shaders
+     if (shaders.length > 0) {
+@@ -68,12 +94,12 @@ export const createDrawingContext = (Skia, paintPool, canvas) => {
+     }
+     // Image Filters
+     if (imageFilters.length > 0) {
+-      getCurrentPaint().setImageFilter(imageFilters.reduceRight((inner, outer) => inner ? Skia.ImageFilter.MakeCompose(outer, inner) : outer));
++      getCurrentPaint().setImageFilter(imageFilters.reduceRight((inner, outer) => inner ? track(Skia.ImageFilter.MakeCompose(outer, inner)) : outer));
+     }
+ 
+     // Path Effects
+     if (pathEffects.length > 0) {
+-      getCurrentPaint().setPathEffect(pathEffects.reduceRight((inner, outer) => inner ? Skia.PathEffect.MakeCompose(outer, inner) : outer));
++      getCurrentPaint().setPathEffect(pathEffects.reduceRight((inner, outer) => inner ? track(Skia.PathEffect.MakeCompose(outer, inner)) : outer));
+     }
+ 
+     // Clear arrays
+@@ -98,6 +124,15 @@ export const createDrawingContext = (Skia, paintPool, canvas) => {
+     // Public methods
+     savePaint,
+     saveBackdropFilter,
++    track,
++    disposeTransients: () => {
++      disposables.forEach(d => {
++        if (typeof d.dispose === "function") {
++          d.dispose();
++        }
++      });
++      disposables.clear();
++    },
+     get paint() {
+       return paints[paints.length - 1];
+     },
+diff --git a/node_modules/@shopify/react-native-skia/lib/module/sksg/Recorder/Player.js b/node_modules/@shopify/react-native-skia/lib/module/sksg/Recorder/Player.js
+index cf984eb..db5a77f 100644
+--- a/node_modules/@shopify/react-native-skia/lib/module/sksg/Recorder/Player.js
++++ b/node_modules/@shopify/react-native-skia/lib/module/sksg/Recorder/Player.js
+@@ -75,6 +75,7 @@ const play = (ctx, _command) => {
+       if (standalone) {
+         const freshPaint = ctx.Skia.Paint();
+         ctx.paint.assign(freshPaint);
++        freshPaint.dispose();
+       }
+       setPaintProperties(ctx.Skia, ctx, command.props, standalone);
+     }
+@@ -167,6 +168,9 @@ const play = (ctx, _command) => {
+       }
+       ctx.paints.pop();
+     });
++    // The per-draw copy is only alive for this command; the canvas keeps
++    // its own native copy of the paint state, so release the WASM object.
++    paint.dispose();
+   }
+ };
+ export function replay(ctx, commands) {
+diff --git a/node_modules/@shopify/react-native-skia/lib/module/sksg/Recorder/commands/Drawing.js b/node_modules/@shopify/react-native-skia/lib/module/sksg/Recorder/commands/Drawing.js
+index 3d6c1f5..54afec6 100644
+--- a/node_modules/@shopify/react-native-skia/lib/module/sksg/Recorder/commands/Drawing.js
++++ b/node_modules/@shopify/react-native-skia/lib/module/sksg/Recorder/commands/Drawing.js
+@@ -68,6 +68,9 @@ export const drawVertices = (ctx, props) => {
+   const defaultBlendMode = colors ? BlendMode.DstOver : BlendMode.SrcOver;
+   const blend = blendMode ? BlendMode[enumKey(blendMode)] : defaultBlendMode;
+   ctx.canvas.drawVertices(vertices, blend, ctx.paint);
++  // The canvas/picture holds its own native ref; release the per-frame
++  // WASM copy of the vertex data.
++  vertices.dispose();
+ };
+ export const drawDiffRect = (ctx, props) => {
+   "worklet";
+diff --git a/node_modules/@shopify/react-native-skia/lib/module/sksg/Recorder/commands/ImageFilters.js b/node_modules/@shopify/react-native-skia/lib/module/sksg/Recorder/commands/ImageFilters.js
+index 6204a8d..f0bef1d 100644
+--- a/node_modules/@shopify/react-native-skia/lib/module/sksg/Recorder/commands/ImageFilters.js
++++ b/node_modules/@shopify/react-native-skia/lib/module/sksg/Recorder/commands/ImageFilters.js
+@@ -103,6 +103,7 @@ const declareDisplacementMapImageFilter = (ctx, props) => {
+   }
+   const map = ctx.Skia.ImageFilter.MakeShader(shader);
+   const imgf = ctx.Skia.ImageFilter.MakeDisplacementMap(ColorChannel[enumKey(channelX)], ColorChannel[enumKey(channelY)], scale, map, null);
++  map.dispose();
+   ctx.imageFilters.push(imgf);
+ };
+ const declareRuntimeShaderImageFilter = (ctx, props) => {
+@@ -125,7 +126,9 @@ const declareImageFilter = (ctx, props) => {
+   const {
+     filter
+   } = props;
+-  ctx.imageFilters.push(filter);
++  // User-owned filter object: bypass the context's transient tracking so it
++  // is not disposed at the end of the frame.
++  Array.prototype.push.call(ctx.imageFilters, filter);
+ };
+ export const composeImageFilters = ctx => {
+   "worklet";
+@@ -146,6 +149,8 @@ export const setBlurMaskFilter = (ctx, props) => {
+   } = props;
+   const mf = ctx.Skia.MaskFilter.MakeBlur(BlurStyle[enumKey(style)], blur, respectCTM);
+   ctx.paint.setMaskFilter(mf);
++  // The paint holds its own native ref; release the transient JS handle.
++  mf.dispose();
+ };
+ export const isPushImageFilter = command => {
+   "worklet";
+diff --git a/node_modules/@shopify/react-native-skia/lib/module/sksg/StaticContainer.js b/node_modules/@shopify/react-native-skia/lib/module/sksg/StaticContainer.js
+index 291d749..812f681 100644
+--- a/node_modules/@shopify/react-native-skia/lib/module/sksg/StaticContainer.js
++++ b/node_modules/@shopify/react-native-skia/lib/module/sksg/StaticContainer.js
+@@ -31,6 +31,10 @@ export class Container {
+     }
+     const ctx = createDrawingContext(this.Skia, this.recording.paintPool, canvas);
+     replay(ctx, this.recording.commands);
++    // Release the transient WASM objects created during the replay (web).
++    if (typeof ctx.disposeTransients === "function") {
++      ctx.disposeTransients();
++    }
+   }
+ }
+ export class StaticContainer extends Container {
+@@ -41,6 +45,9 @@ export class StaticContainer extends Container {
+   redraw() {
+     const recorder = new Recorder();
+     visit(recorder, this.root);
++    if (this.recording && this.recording.paintPool) {
++      this.recording.paintPool.forEach(paint => paint.dispose());
++    }
+     this.recording = recorder.getRecording();
+     const isOnScreen = this.nativeId !== -1;
+     if (isOnScreen) {
