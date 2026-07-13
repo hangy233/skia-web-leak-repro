@@ -1,5 +1,13 @@
 # react-native-skia web WASM memory-leak repro
 
+> ✅ **Resolved.** This leak was fixed in **`@shopify/react-native-skia@2.8.0`**
+> (a `FrameScope` that disposes every per-frame CanvasKit object). Upgrade to
+> 2.8.0 or later — no patch needed. This repo is kept for reference.
+>
+> Issue: [Shopify/react-native-skia#3938](https://github.com/Shopify/react-native-skia/issues/3938) ·
+> Fix: [PR #3940](https://github.com/Shopify/react-native-skia/pull/3940).
+> Everything below describes the bug as it existed in 2.6.2.
+
 Minimal reproduction for a memory leak in `@shopify/react-native-skia`'s **web**
 renderer: the per-frame replay path (`sksg/Recorder`) creates CanvasKit WASM
 objects (paints, shaders, mask filters, color/image filters, vertex buffers)
