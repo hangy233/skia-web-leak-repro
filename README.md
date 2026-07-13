@@ -37,16 +37,42 @@ in `App.tsx` to watch the heap grow unbounded toward the real ceiling instead.
 The `fix` branch is the same demo plus a
 [patch-package](https://www.npmjs.com/package/patch-package) patch
 (`patches/@shopify+react-native-skia+2.6.2.patch`) that disposes the
-per-frame transients:
+per-frame transients.
+
+### Applying it in this repo
 
 ```
 git checkout fix
-npm install   # postinstall applies the patch
+npm install   # the postinstall script runs patch-package, which applies the patch
 npm run web
 ```
 
+If `node_modules` is already installed and you only switched branches, apply
+the patch without reinstalling:
+
+```
+npx patch-package
+```
+
 Same scene, same heap cap — but memory plateaus after warmup and the demo
-runs indefinitely. The patch:
+runs indefinitely.
+
+### Applying it in your own project
+
+1. `npm install --save-dev patch-package`
+2. Add `"postinstall": "patch-package"` to `scripts` in your `package.json`
+3. Copy this branch's `patches/` folder into your project root
+4. Run `npx patch-package` once now; every future `npm install` re-applies it
+   automatically
+
+The patch is keyed to `@shopify/react-native-skia@2.6.2` exactly. On any
+other version patch-package refuses to apply it — regenerate the patch
+against that version's files instead (and check whether upstream has fixed
+the leak first).
+
+### What the patch does
+
+The patch:
 
 - disposes every transient created while replaying a frame (per-draw paint
   copies, shaders, mask/color/image filters, compose intermediates, vertex
